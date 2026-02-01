@@ -3,18 +3,9 @@
 @source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
 @source '../../storage/framework/views/*.php';
 @source '../**/*.blade.php';
-@source '../**/*.js';
+@source '../**/*.jsx';
 
 @theme {
-    --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
-
-    --color-primary-green: #0D5C3D;
-    --color-primary-green-light: #1A7B52;
-    --color-primary-gold: #D4AF37;
-    --color-primary-gold-light: #F6D365;
-}
-
-body {
-    background-color: #111827;
-    color: white;
+    --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji',
+        'Segoe UI Symbol', 'Noto Color Emoji';
 }

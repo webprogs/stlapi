@@ -2,22 +2,31 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class DeviceUser extends Model
 {
+    use HasFactory;
+
     protected $fillable = [
         'device_id',
-        'local_id',
-        'username',
-        'role',
+        'local_user_id',
         'name',
-        'device_created_at',
+        'pin',
+        'is_active',
     ];
 
-    protected $casts = [
-        'device_created_at' => 'datetime',
+    protected function casts(): array
+    {
+        return [
+            'is_active' => 'boolean',
+        ];
+    }
+
+    protected $hidden = [
+        'pin',
     ];
 
     public function device(): BelongsTo

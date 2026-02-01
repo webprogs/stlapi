@@ -10,382 +10,351 @@ use Illuminate\Support\Facades\DB;
 
 class AnalyticsController extends Controller
 {
-    public function summary(): JsonResponse
+    public function summary(Request $request): JsonResponse
     {
-        $totalEarnings = Transaction::sum('amount');
-        $todayEarnings = Transaction::whereDate('created_at', today())->sum('amount');
-        $totalTransactions = Transaction::count();
-        $todayTransactions = Transaction::whereDate('created_at', today())->count();
-        $activeDevices = Device::where('is_active', true)->count();
-        $onlineDevices = Device::where('last_seen_at', '>=', now()->subMinutes(15))->count();
+        $dateFrom = $request->get('date_from', today()->startOfMonth());
+        $dateTo = $request->get('date_to', today());
+
+        $totalBets = Transaction::whereBetween('draw_date', [$dateFrom, $dateTo])->sum('amount');
+        $totalWinnings = Transaction::whereBetween('draw_date', [$dateFrom, $dateTo])
+            ->whereIn('status', ['won', 'claimed'])
+            ->sum('win_amount');
+        $netEarnings = $totalBets * config('stl.net_earnings_rate') - $totalWinnings;
+
+        $transactionCounts = Transaction::whereBetween('draw_date', [$dateFrom, $dateTo])
+            ->select('status', DB::raw('count(*) as count'))
+            ->groupBy('status')
+            ->pluck('count', 'status');
+
+        $activeDevices = Device::where('is_active', true)
+            ->whereNotNull('last_sync_at')
+            ->where('last_sync_at', '>=', now()->subDay())
+            ->count();
+
+        $totalDevices = Device::count();
 
         return response()->json([
-            'success' => true,
-            'summary' => [
-                'total_earnings' => round($totalEarnings, 2),
-                'today_earnings' => round($todayEarnings, 2),
-                'total_transactions' => $totalTransactions,
-                'today_transactions' => $todayTransactions,
-                'active_devices' => $activeDevices,
-                'online_devices' => $onlineDevices,
+            'period' => [
+                'from' => $dateFrom,
+                'to' => $dateTo,
+            ],
+            'financial' => [
+                'total_bets' => round($totalBets, 2),
+                'total_winnings' => round($totalWinnings, 2),
+                'net_earnings' => round($netEarnings, 2),
+                'gross_revenue' => round($totalBets * config('stl.net_earnings_rate'), 2),
+            ],
+            'transactions' => [
+                'total' => array_sum($transactionCounts->toArray()),
+                'pending' => $transactionCounts['pending'] ?? 0,
+                'won' => $transactionCounts['won'] ?? 0,
+                'lost' => $transactionCounts['lost'] ?? 0,
+                'claimed' => $transactionCounts['claimed'] ?? 0,
+            ],
+            'devices' => [
+                'total' => $totalDevices,
+                'active_last_24h' => $activeDevices,
             ],
         ]);
     }
 
-    public function byDevice(): JsonResponse
+    public function byGame(Request $request): JsonResponse
     {
-        $devices = Device::with(['transactions' => function ($query) {
-            $query->selectRaw('device_id, COUNT(*) as transaction_count, SUM(amount) as total_earnings')
-                ->groupBy('device_id');
-        }])->where('is_active', true)->get();
+        $dateFrom = $request->get('date_from', today()->startOfMonth());
+        $dateTo = $request->get('date_to', today());
 
-        $data = $devices->map(function ($device) {
-            $stats = $device->transactions->first();
-            return [
-                'device_id' => $device->id,
-                'device_name' => $device->device_name ?? 'Device ' . substr($device->device_id, 0, 8),
-                'transaction_count' => $stats->transaction_count ?? 0,
-                'total_earnings' => round($stats->total_earnings ?? 0, 2),
-                'today_earnings' => round($device->getTodayEarnings(), 2),
-                'last_seen_at' => $device->last_seen_at,
-                'is_online' => $device->last_seen_at && $device->last_seen_at->gte(now()->subMinutes(15)),
-            ];
-        });
+        $stats = Transaction::whereBetween('draw_date', [$dateFrom, $dateTo])
+            ->select(
+                'game_type',
+                DB::raw('count(*) as total_bets'),
+                DB::raw('sum(amount) as total_amount'),
+                DB::raw('sum(case when status in ("won", "claimed") then win_amount else 0 end) as total_winnings')
+            )
+            ->groupBy('game_type')
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'game_type' => $item->game_type,
+                    'total_bets' => $item->total_bets,
+                    'total_amount' => round($item->total_amount, 2),
+                    'total_winnings' => round($item->total_winnings, 2),
+                    'net_earnings' => round($item->total_amount * config('stl.net_earnings_rate') - $item->total_winnings, 2),
+                ];
+            });
 
         return response()->json([
-            'success' => true,
-            'devices' => $data,
+            'period' => ['from' => $dateFrom, 'to' => $dateTo],
+            'data' => $stats,
         ]);
     }
 
-    public function byPeriod(Request $request): JsonResponse
+    public function byDrawTime(Request $request): JsonResponse
     {
-        $request->validate([
-            'period' => 'nullable|in:day,week,month,year',
-            'start_date' => 'nullable|date',
-            'end_date' => 'nullable|date',
+        $dateFrom = $request->get('date_from', today()->startOfMonth());
+        $dateTo = $request->get('date_to', today());
+
+        $stats = Transaction::whereBetween('draw_date', [$dateFrom, $dateTo])
+            ->select(
+                'draw_time',
+                DB::raw('count(*) as total_bets'),
+                DB::raw('sum(amount) as total_amount'),
+                DB::raw('sum(case when status in ("won", "claimed") then win_amount else 0 end) as total_winnings')
+            )
+            ->groupBy('draw_time')
+            ->orderByRaw("FIELD(draw_time, '11AM', '4PM', '9PM')")
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'draw_time' => $item->draw_time,
+                    'total_bets' => $item->total_bets,
+                    'total_amount' => round($item->total_amount, 2),
+                    'total_winnings' => round($item->total_winnings, 2),
+                    'net_earnings' => round($item->total_amount * config('stl.net_earnings_rate') - $item->total_winnings, 2),
+                ];
+            });
+
+        return response()->json([
+            'period' => ['from' => $dateFrom, 'to' => $dateTo],
+            'data' => $stats,
         ]);
+    }
 
-        $period = $request->query('period', 'week');
+    public function byDevice(Request $request): JsonResponse
+    {
+        $dateFrom = $request->get('date_from', today()->startOfMonth());
+        $dateTo = $request->get('date_to', today());
 
-        $dateFormat = match ($period) {
-            'day' => '%Y-%m-%d %H:00',
-            'week' => '%Y-%m-%d',
-            'month' => '%Y-%m-%d',
-            'year' => '%Y-%m',
-            default => '%Y-%m-%d',
+        $stats = Transaction::whereBetween('draw_date', [$dateFrom, $dateTo])
+            ->join('devices', 'transactions.device_id', '=', 'devices.id')
+            ->select(
+                'devices.id',
+                'devices.device_name',
+                'devices.uuid',
+                DB::raw('count(*) as total_bets'),
+                DB::raw('sum(transactions.amount) as total_amount'),
+                DB::raw('sum(case when transactions.status in ("won", "claimed") then transactions.win_amount else 0 end) as total_winnings')
+            )
+            ->groupBy('devices.id', 'devices.device_name', 'devices.uuid')
+            ->orderByDesc('total_amount')
+            ->limit($request->get('limit', 10))
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'device_id' => $item->id,
+                    'device_name' => $item->device_name,
+                    'uuid' => $item->uuid,
+                    'total_bets' => $item->total_bets,
+                    'total_amount' => round($item->total_amount, 2),
+                    'total_winnings' => round($item->total_winnings, 2),
+                    'net_earnings' => round($item->total_amount * config('stl.net_earnings_rate') - $item->total_winnings, 2),
+                ];
+            });
+
+        return response()->json([
+            'period' => ['from' => $dateFrom, 'to' => $dateTo],
+            'data' => $stats,
+        ]);
+    }
+
+    public function daily(Request $request): JsonResponse
+    {
+        $dateFrom = $request->get('date_from', today()->subDays(30));
+        $dateTo = $request->get('date_to', today());
+
+        $stats = Transaction::whereBetween('draw_date', [$dateFrom, $dateTo])
+            ->select(
+                'draw_date',
+                DB::raw('count(*) as total_bets'),
+                DB::raw('sum(amount) as total_amount'),
+                DB::raw('sum(case when status in ("won", "claimed") then win_amount else 0 end) as total_winnings')
+            )
+            ->groupBy('draw_date')
+            ->orderBy('draw_date')
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'date' => $item->draw_date->toDateString(),
+                    'total_bets' => $item->total_bets,
+                    'total_amount' => round($item->total_amount, 2),
+                    'total_winnings' => round($item->total_winnings, 2),
+                    'net_earnings' => round($item->total_amount * config('stl.net_earnings_rate') - $item->total_winnings, 2),
+                ];
+            });
+
+        return response()->json([
+            'period' => ['from' => $dateFrom, 'to' => $dateTo],
+            'data' => $stats,
+        ]);
+    }
+
+    public function device(Request $request, Device $device): JsonResponse
+    {
+        $period = $request->get('period', 'month');
+
+        // Calculate date range based on period
+        $dateTo = today();
+        $dateFrom = match ($period) {
+            'day' => today(),
+            'week' => today()->startOfWeek(),
+            'month' => today()->startOfMonth(),
+            'year' => today()->startOfYear(),
+            'all' => null,
+            default => today()->startOfMonth(),
         };
 
-        $startDate = match ($period) {
-            'day' => now()->startOfDay(),
-            'week' => now()->subDays(7),
-            'month' => now()->subDays(30),
-            'year' => now()->subYear(),
-            default => now()->subDays(7),
-        };
+        $query = Transaction::where('device_id', $device->id);
 
-        if ($request->start_date) {
-            $startDate = $request->start_date;
+        if ($dateFrom) {
+            $query->whereBetween('draw_date', [$dateFrom, $dateTo]);
         }
-
-        $query = Transaction::selectRaw("DATE_FORMAT(created_at, '$dateFormat') as date, SUM(amount) as earnings, COUNT(*) as transactions")
-            ->where('created_at', '>=', $startDate)
-            ->groupBy('date')
-            ->orderBy('date');
-
-        if ($request->end_date) {
-            $query->where('created_at', '<=', $request->end_date);
-        }
-
-        $data = $query->get();
-
-        return response()->json([
-            'success' => true,
-            'period' => $period,
-            'data' => $data->map(fn ($row) => [
-                'date' => $row->date,
-                'earnings' => round($row->earnings, 2),
-                'transactions' => $row->transactions,
-            ]),
-        ]);
-    }
-
-    public function transactions(Request $request): JsonResponse
-    {
-        $request->validate([
-            'device_id' => 'nullable|integer|exists:devices,id',
-            'date' => 'nullable|date',
-            'game_type' => 'nullable|string',
-            'page' => 'nullable|integer|min:1',
-            'per_page' => 'nullable|integer|min:1|max:100',
-        ]);
-
-        $query = Transaction::with('device')
-            ->orderBy('created_at', 'desc');
-
-        if ($request->device_id) {
-            $query->where('device_id', $request->device_id);
-        }
-
-        if ($request->date) {
-            $query->whereDate('draw_date', $request->date);
-        }
-
-        if ($request->game_type) {
-            $query->where('game_type', $request->game_type);
-        }
-
-        $perPage = $request->query('per_page', 20);
-        $transactions = $query->paginate($perPage);
-
-        return response()->json([
-            'success' => true,
-            'transactions' => $transactions->items(),
-            'pagination' => [
-                'current_page' => $transactions->currentPage(),
-                'last_page' => $transactions->lastPage(),
-                'per_page' => $transactions->perPage(),
-                'total' => $transactions->total(),
-            ],
-        ]);
-    }
-
-    /**
-     * Get bets/transactions by date grouped by device
-     */
-    public function betsByDate(Request $request): JsonResponse
-    {
-        $request->validate([
-            'date' => 'required|date',
-            'game_type' => 'nullable|string',
-            'draw_time' => 'nullable|string',
-        ]);
-
-        $date = $request->query('date');
-
-        $query = Transaction::with('device')
-            ->whereDate('draw_date', $date)
-            ->orderBy('device_id')
-            ->orderBy('draw_time')
-            ->orderBy('created_at', 'desc');
-
-        if ($request->game_type) {
-            $query->where('game_type', $request->game_type);
-        }
-
-        if ($request->draw_time) {
-            $query->where('draw_time', $request->draw_time);
-        }
-
-        $transactions = $query->get();
-
-        // Group by device
-        $groupedByDevice = $transactions->groupBy('device_id')->map(function ($deviceTransactions, $deviceId) {
-            $device = $deviceTransactions->first()->device;
-            $byDrawTime = $deviceTransactions->groupBy('draw_time');
-
-            return [
-                'device_id' => $deviceId,
-                'device_name' => $device?->device_name ?? 'Unknown Device',
-                'total_bets' => $deviceTransactions->count(),
-                'total_amount' => round($deviceTransactions->sum('amount'), 2),
-                'bets_by_draw_time' => $byDrawTime->map(function ($bets, $drawTime) {
-                    return [
-                        'draw_time' => $drawTime,
-                        'count' => $bets->count(),
-                        'amount' => round($bets->sum('amount'), 2),
-                        'bets' => $bets->values()->map(fn ($bet) => [
-                            'id' => $bet->id,
-                            'transaction_id' => $bet->transaction_id,
-                            'numbers' => $bet->numbers,
-                            'game_type' => $bet->game_type,
-                            'amount' => $bet->amount,
-                            'verified' => $bet->verified,
-                            'created_at' => $bet->created_at,
-                        ]),
-                    ];
-                })->values(),
-            ];
-        })->values();
 
         // Summary stats
-        $summary = [
-            'date' => $date,
-            'total_bets' => $transactions->count(),
-            'total_amount' => round($transactions->sum('amount'), 2),
-            'devices_count' => $groupedByDevice->count(),
-            'by_game_type' => $transactions->groupBy('game_type')->map(fn ($g) => [
-                'count' => $g->count(),
-                'amount' => round($g->sum('amount'), 2),
-            ]),
-            'by_draw_time' => $transactions->groupBy('draw_time')->map(fn ($g) => [
-                'count' => $g->count(),
-                'amount' => round($g->sum('amount'), 2),
-            ]),
-        ];
+        $totalBets = (clone $query)->sum('amount');
+        $totalWinnings = (clone $query)
+            ->whereIn('status', ['won', 'claimed'])
+            ->sum('win_amount');
+        $netEarnings = $totalBets * config('stl.net_earnings_rate') - $totalWinnings;
 
-        return response()->json([
-            'success' => true,
-            'summary' => $summary,
-            'devices' => $groupedByDevice,
-        ]);
-    }
+        $transactionCounts = (clone $query)
+            ->select('status', DB::raw('count(*) as count'))
+            ->groupBy('status')
+            ->pluck('count', 'status');
 
-    /**
-     * Get calendar data for bets (which dates have bets)
-     */
-    public function betsCalendar(Request $request): JsonResponse
-    {
-        $request->validate([
-            'month' => 'required|integer|between:1,12',
-            'year' => 'required|integer|min:2000',
-        ]);
-
-        $month = $request->query('month');
-        $year = $request->query('year');
-
-        $startDate = "$year-" . str_pad($month, 2, '0', STR_PAD_LEFT) . "-01";
-        $endDate = date('Y-m-t', strtotime($startDate));
-
-        $data = Transaction::selectRaw('draw_date, COUNT(*) as bet_count, SUM(amount) as total_amount, COUNT(DISTINCT device_id) as device_count')
-            ->whereBetween('draw_date', [$startDate, $endDate])
-            ->groupBy('draw_date')
+        // By game type
+        $byGame = (clone $query)
+            ->select(
+                'game_type',
+                DB::raw('count(*) as total_bets'),
+                DB::raw('sum(amount) as total_amount'),
+                DB::raw('sum(case when status in ("won", "claimed") then win_amount else 0 end) as total_winnings'),
+                DB::raw('sum(case when status in ("won", "claimed") then 1 else 0 end) as winning_bets')
+            )
+            ->groupBy('game_type')
             ->get()
-            ->keyBy('draw_date')
-            ->map(fn ($row) => [
-                'bet_count' => $row->bet_count,
-                'total_amount' => round($row->total_amount, 2),
-                'device_count' => $row->device_count,
+            ->map(fn($item) => [
+                'game_type' => $item->game_type,
+                'total_bets' => $item->total_bets,
+                'winning_bets' => (int) $item->winning_bets,
+                'total_amount' => round($item->total_amount, 2),
+                'total_winnings' => round($item->total_winnings, 2),
+            ]);
+
+        // By draw time
+        $byDrawTime = (clone $query)
+            ->select(
+                'draw_time',
+                DB::raw('count(*) as total_bets'),
+                DB::raw('sum(amount) as total_amount'),
+                DB::raw('sum(case when status in ("won", "claimed") then 1 else 0 end) as winning_bets')
+            )
+            ->groupBy('draw_time')
+            ->orderByRaw("FIELD(draw_time, '11AM', '4PM', '9PM')")
+            ->get()
+            ->map(fn($item) => [
+                'draw_time' => $item->draw_time,
+                'total_bets' => $item->total_bets,
+                'winning_bets' => (int) $item->winning_bets,
+                'total_amount' => round($item->total_amount, 2),
+            ]);
+
+        // Daily breakdown (last 7 days for day/week, last 30 for month, last 12 months for year)
+        $dailyQuery = Transaction::where('device_id', $device->id);
+        if ($dateFrom) {
+            $dailyQuery->whereBetween('draw_date', [$dateFrom, $dateTo]);
+        }
+
+        $daily = $dailyQuery
+            ->select(
+                'draw_date',
+                DB::raw('count(*) as total_bets'),
+                DB::raw('sum(amount) as total_amount'),
+                DB::raw('sum(case when status in ("won", "claimed") then win_amount else 0 end) as total_winnings'),
+                DB::raw('sum(case when status in ("won", "claimed") then 1 else 0 end) as winning_bets')
+            )
+            ->groupBy('draw_date')
+            ->orderBy('draw_date', 'desc')
+            ->limit(30)
+            ->get()
+            ->map(fn($item) => [
+                'date' => $item->draw_date->toDateString(),
+                'total_bets' => $item->total_bets,
+                'winning_bets' => (int) $item->winning_bets,
+                'total_amount' => round($item->total_amount, 2),
+                'total_winnings' => round($item->total_winnings, 2),
+                'net_earnings' => round($item->total_amount * config('stl.net_earnings_rate') - $item->total_winnings, 2),
             ]);
 
         return response()->json([
-            'success' => true,
-            'calendar_data' => $data,
+            'device' => [
+                'id' => $device->id,
+                'name' => $device->device_name,
+                'uuid' => $device->uuid,
+            ],
+            'period' => [
+                'type' => $period,
+                'from' => $dateFrom?->toDateString(),
+                'to' => $dateTo->toDateString(),
+            ],
+            'summary' => [
+                'total_bets' => round($totalBets, 2),
+                'total_winnings' => round($totalWinnings, 2),
+                'net_earnings' => round($netEarnings, 2),
+                'gross_revenue' => round($totalBets * config('stl.net_earnings_rate'), 2),
+            ],
+            'transactions' => [
+                'total' => array_sum($transactionCounts->toArray()),
+                'pending' => $transactionCounts['pending'] ?? 0,
+                'won' => $transactionCounts['won'] ?? 0,
+                'lost' => $transactionCounts['lost'] ?? 0,
+                'claimed' => $transactionCounts['claimed'] ?? 0,
+                'winning_total' => ($transactionCounts['won'] ?? 0) + ($transactionCounts['claimed'] ?? 0),
+            ],
+            'by_game' => $byGame,
+            'by_draw_time' => $byDrawTime,
+            'daily' => $daily,
         ]);
     }
 
-    /**
-     * Get most bet number combinations statistics
-     */
-    public function popularNumbers(Request $request): JsonResponse
+    public function topNumbers(Request $request): JsonResponse
     {
-        $request->validate([
-            'period' => 'nullable|in:day,week,month,year,all',
-            'game_type' => 'nullable|string',
-            'limit' => 'nullable|integer|min:1|max:100',
-        ]);
+        $dateFrom = $request->get('date_from', today()->startOfMonth());
+        $dateTo = $request->get('date_to', today());
+        $gameType = $request->get('game_type');
 
-        $period = $request->query('period', 'month');
-        $limit = $request->query('limit', 20);
+        $query = Transaction::whereBetween('draw_date', [$dateFrom, $dateTo]);
 
-        $query = Transaction::query();
-
-        // Apply period filter
-        $startDate = match ($period) {
-            'day' => now()->startOfDay(),
-            'week' => now()->subDays(7),
-            'month' => now()->subDays(30),
-            'year' => now()->subYear(),
-            'all' => null,
-            default => now()->subDays(30),
-        };
-
-        if ($startDate) {
-            $query->where('created_at', '>=', $startDate);
+        if ($gameType) {
+            $query->where('game_type', $gameType);
         }
 
-        if ($request->game_type) {
-            $query->where('game_type', $request->game_type);
-        }
+        $transactions = $query->get(['numbers', 'amount']);
 
-        // Get all transactions and group by numbers
-        $transactions = $query->get();
-
-        $numberStats = $transactions->groupBy(function ($t) {
-            // Convert numbers array to string for grouping
-            $numbers = is_array($t->numbers) ? $t->numbers : json_decode($t->numbers, true);
-            return implode('-', $numbers ?? []);
-        })->map(function ($group, $numbersStr) {
-            $first = $group->first();
-            $numbers = is_array($first->numbers) ? $first->numbers : json_decode($first->numbers, true);
-            return [
-                'numbers' => $numbers,
-                'numbers_str' => $numbersStr,
-                'count' => $group->count(),
-                'total_amount' => round($group->sum('amount'), 2),
-                'game_type' => $first->game_type,
-                'devices' => $group->pluck('device_id')->unique()->count(),
-            ];
-        })->sortByDesc('count')->take($limit)->values();
-
-        // Get statistics by individual digit position
-        $digitStats = [];
-        $gameTypes = $transactions->pluck('game_type')->unique();
-
-        foreach ($gameTypes as $gameType) {
-            $gameTransactions = $transactions->where('game_type', $gameType);
-            $digitCount = match ($gameType) {
-                'SWER4' => 4,
-                'SWER3' => 3,
-                'SWER2' => 2,
-                default => 0,
-            };
-
-            $positionStats = [];
-            for ($pos = 0; $pos < $digitCount; $pos++) {
-                $digitFreq = [];
-                foreach ($gameTransactions as $t) {
-                    $numbers = is_array($t->numbers) ? $t->numbers : json_decode($t->numbers, true);
-                    if (isset($numbers[$pos])) {
-                        $digit = (string)$numbers[$pos];
-                        $digitFreq[$digit] = ($digitFreq[$digit] ?? 0) + 1;
-                    }
-                }
-                arsort($digitFreq);
-                $positionStats[] = [
-                    'position' => $pos + 1,
-                    'frequencies' => $digitFreq,
-                    'most_common' => array_key_first($digitFreq),
-                ];
+        $numberCounts = [];
+        foreach ($transactions as $tx) {
+            $key = implode('-', $tx->numbers);
+            if (!isset($numberCounts[$key])) {
+                $numberCounts[$key] = ['count' => 0, 'amount' => 0];
             }
-
-            $digitStats[$gameType] = $positionStats;
+            $numberCounts[$key]['count']++;
+            $numberCounts[$key]['amount'] += $tx->amount;
         }
 
-        // Get stats by device
-        $deviceStats = $transactions->groupBy('device_id')->map(function ($group) {
-            $device = $group->first()->device;
-            $topNumbers = $group->groupBy(function ($t) {
-                $numbers = is_array($t->numbers) ? $t->numbers : json_decode($t->numbers, true);
-                return implode('-', $numbers ?? []);
-            })->sortByDesc(fn ($g) => $g->count())->take(5)->map(function ($g, $numbersStr) {
-                $first = $g->first();
-                $numbers = is_array($first->numbers) ? $first->numbers : json_decode($first->numbers, true);
-                return [
-                    'numbers' => $numbers,
-                    'count' => $g->count(),
-                ];
-            })->values();
+        arsort($numberCounts);
+        $topNumbers = array_slice($numberCounts, 0, $request->get('limit', 20), true);
 
-            return [
-                'device_id' => $group->first()->device_id,
-                'device_name' => $device?->device_name ?? 'Unknown Device',
-                'total_bets' => $group->count(),
-                'top_combinations' => $topNumbers,
+        $result = [];
+        foreach ($topNumbers as $numbers => $data) {
+            $result[] = [
+                'numbers' => $numbers,
+                'bet_count' => $data['count'],
+                'total_amount' => round($data['amount'], 2),
             ];
-        })->values();
+        }
 
         return response()->json([
-            'success' => true,
-            'period' => $period,
-            'summary' => [
-                'total_bets' => $transactions->count(),
-                'unique_combinations' => $numberStats->count(),
-                'total_amount' => round($transactions->sum('amount'), 2),
-            ],
-            'top_combinations' => $numberStats,
-            'digit_statistics' => $digitStats,
-            'device_statistics' => $deviceStats,
+            'period' => ['from' => $dateFrom, 'to' => $dateTo],
+            'game_type' => $gameType ?? 'all',
+            'data' => $result,
         ]);
     }
 }

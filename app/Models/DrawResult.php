@@ -2,53 +2,41 @@
 
 namespace App\Models;
 
+use App\Events\DrawResultCreated;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class DrawResult extends Model
 {
+    use HasFactory;
+
     protected $fillable = [
-        'device_id',
-        'local_id',
         'draw_date',
         'draw_time',
         'game_type',
         'winning_numbers',
-        'device_created_at',
+        'set_by',
+        'is_official',
+        'modified_at',
     ];
 
-    protected $casts = [
-        'winning_numbers' => 'array',
-        'draw_date' => 'date',
-        'device_created_at' => 'datetime',
+    protected function casts(): array
+    {
+        return [
+            'winning_numbers' => 'array',
+            'draw_date' => 'date',
+            'is_official' => 'boolean',
+            'modified_at' => 'datetime',
+        ];
+    }
+
+    protected $dispatchesEvents = [
+        'created' => DrawResultCreated::class,
     ];
 
-    public function device(): BelongsTo
+    public function setBy(): BelongsTo
     {
-        return $this->belongsTo(Device::class);
-    }
-
-    /**
-     * Check if this is an admin-created result
-     */
-    public function isAdminCreated(): bool
-    {
-        return is_null($this->device_id);
-    }
-
-    /**
-     * Scope for admin-created results
-     */
-    public function scopeAdminCreated($query)
-    {
-        return $query->whereNull('device_id');
-    }
-
-    /**
-     * Scope for device-synced results
-     */
-    public function scopeDeviceSynced($query)
-    {
-        return $query->whereNotNull('device_id');
+        return $this->belongsTo(User::class, 'set_by');
     }
 }

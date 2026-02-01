@@ -2,32 +2,49 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Str;
 
 class Device extends Model
 {
+    use HasFactory;
+
     protected $fillable = [
-        'device_id',
-        'api_key',
+        'uuid',
         'device_name',
-        'is_active',
-        'last_seen_at',
-    ];
-
-    protected $casts = [
-        'is_active' => 'boolean',
-        'last_seen_at' => 'datetime',
-    ];
-
-    protected $hidden = [
         'api_key',
+        'is_active',
+        'last_sync_at',
+        'last_ip',
     ];
 
-    public static function generateApiKey(): string
+    protected function casts(): array
     {
-        return Str::random(64);
+        return [
+            'is_active' => 'boolean',
+            'last_sync_at' => 'datetime',
+        ];
+    }
+
+    protected static function boot()
+    {
+        parent::boot();
+
+        static::creating(function ($device) {
+            if (empty($device->uuid)) {
+                $device->uuid = (string) Str::uuid();
+            }
+            if (empty($device->api_key)) {
+                $device->api_key = Str::random(64);
+            }
+        });
+    }
+
+    public function deviceUsers(): HasMany
+    {
+        return $this->hasMany(DeviceUser::class);
     }
 
     public function transactions(): HasMany
@@ -35,30 +52,15 @@ class Device extends Model
         return $this->hasMany(Transaction::class);
     }
 
-    public function drawResults(): HasMany
+    public function syncLogs(): HasMany
     {
-        return $this->hasMany(DrawResult::class);
+        return $this->hasMany(SyncLog::class);
     }
 
-    public function users(): HasMany
+    public function regenerateApiKey(): string
     {
-        return $this->hasMany(DeviceUser::class);
-    }
-
-    public function updateLastSeen(): void
-    {
-        $this->update(['last_seen_at' => now()]);
-    }
-
-    public function getTotalEarnings(): float
-    {
-        return $this->transactions()->sum('amount');
-    }
-
-    public function getTodayEarnings(): float
-    {
-        return $this->transactions()
-            ->whereDate('created_at', today())
-            ->sum('amount');
+        $this->api_key = Str::random(64);
+        $this->save();
+        return $this->api_key;
     }
 }

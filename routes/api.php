@@ -1,64 +1,62 @@
 <?php
 
+use App\Http\Controllers\AdminAuthController;
 use App\Http\Controllers\AnalyticsController;
-use App\Http\Controllers\AuthController;
 use App\Http\Controllers\DeviceController;
 use App\Http\Controllers\DrawResultController;
+use App\Http\Controllers\PingController;
+use App\Http\Controllers\ReportController;
 use App\Http\Controllers\SyncController;
+use App\Http\Controllers\SyncLogController;
+use App\Http\Controllers\TransactionController;
 use Illuminate\Support\Facades\Route;
 
-/*
-|--------------------------------------------------------------------------
-| API Routes
-|--------------------------------------------------------------------------
-*/
+// Public routes
+Route::get('draw-results/today', [DrawResultController::class, 'today']);
 
-// Admin Authentication (no auth required)
-Route::prefix('auth')->group(function () {
-    Route::post('/login', [AuthController::class, 'login']);
-});
+// Admin authentication
+Route::prefix('admin')->group(function () {
+    Route::post('login', [AdminAuthController::class, 'login']);
 
-// Admin authenticated routes (Sanctum)
-Route::middleware('auth:sanctum')->group(function () {
-    // Auth
-    Route::post('/auth/logout', [AuthController::class, 'logout']);
-    Route::get('/auth/me', [AuthController::class, 'me']);
+    Route::middleware('auth:sanctum')->group(function () {
+        Route::post('logout', [AdminAuthController::class, 'logout']);
+        Route::get('me', [AdminAuthController::class, 'me']);
 
-    // Device Management
-    Route::apiResource('devices', DeviceController::class);
-    Route::post('/devices/{device}/regenerate-key', [DeviceController::class, 'regenerateKey']);
+        // Device management
+        Route::apiResource('devices', DeviceController::class);
+        Route::post('devices/{device}/regenerate-key', [DeviceController::class, 'regenerateKey']);
 
-    // Analytics
-    Route::prefix('analytics')->group(function () {
-        Route::get('/summary', [AnalyticsController::class, 'summary']);
-        Route::get('/by-device', [AnalyticsController::class, 'byDevice']);
-        Route::get('/by-period', [AnalyticsController::class, 'byPeriod']);
-        Route::get('/transactions', [AnalyticsController::class, 'transactions']);
-        Route::get('/bets-by-date', [AnalyticsController::class, 'betsByDate']);
-        Route::get('/bets-calendar', [AnalyticsController::class, 'betsCalendar']);
-        Route::get('/popular-numbers', [AnalyticsController::class, 'popularNumbers']);
+        // Transaction management
+        Route::get('transactions', [TransactionController::class, 'index']);
+        Route::get('transactions/{transaction}', [TransactionController::class, 'show']);
+        Route::post('transactions/{transaction}/claim', [TransactionController::class, 'claim']);
+
+        // Draw results management
+        Route::apiResource('draw-results', DrawResultController::class);
+
+        // Analytics
+        Route::prefix('analytics')->group(function () {
+            Route::get('summary', [AnalyticsController::class, 'summary']);
+            Route::get('by-game', [AnalyticsController::class, 'byGame']);
+            Route::get('by-draw-time', [AnalyticsController::class, 'byDrawTime']);
+            Route::get('by-device', [AnalyticsController::class, 'byDevice']);
+            Route::get('daily', [AnalyticsController::class, 'daily']);
+            Route::get('top-numbers', [AnalyticsController::class, 'topNumbers']);
+            Route::get('device/{device}', [AnalyticsController::class, 'device']);
+        });
+
+        // Reports
+        Route::get('reports/daily', [ReportController::class, 'daily']);
+
+        // Sync logs
+        Route::get('sync-logs', [SyncLogController::class, 'index']);
     });
-
-    // Draw Results Management
-    Route::prefix('draw-results')->group(function () {
-        Route::get('/by-date', [DrawResultController::class, 'getByDate']);
-        Route::post('/', [DrawResultController::class, 'store']);
-        Route::delete('/{id}', [DrawResultController::class, 'destroy']);
-        Route::get('/winners', [DrawResultController::class, 'getWinners']);
-        Route::get('/calendar', [DrawResultController::class, 'getCalendarData']);
-        Route::get('/dates-with-results', [DrawResultController::class, 'getDatesWithResults']);
-    });
 });
 
-// Device authenticated routes (API Key)
-Route::middleware('api.key')->prefix('sync')->group(function () {
-    Route::post('/push', [SyncController::class, 'push']);
-    Route::get('/pull', [SyncController::class, 'pull']);
-    Route::post('/full', [SyncController::class, 'full']);
-    Route::get('/status', [SyncController::class, 'status']);
-});
-
-// Device authenticated routes for draw results (API Key)
-Route::middleware('api.key')->prefix('draw-results')->group(function () {
-    Route::get('/by-date', [DrawResultController::class, 'getByDate']);
+// Device API (requires device authentication)
+Route::middleware('auth.device')->group(function () {
+    Route::get('ping', PingController::class);
+    Route::post('sync', [SyncController::class, 'sync']);
+    Route::post('sync/batch', [SyncController::class, 'batch']);
+    Route::get('sync/pull', [SyncController::class, 'pull']);
 });

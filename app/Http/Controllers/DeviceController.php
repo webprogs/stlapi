@@ -5,56 +5,44 @@ namespace App\Http\Controllers;
 use App\Models\Device;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Str;
 
 class DeviceController extends Controller
 {
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
-        $devices = Device::with(['transactions' => function ($query) {
-            $query->selectRaw('device_id, COUNT(*) as count, SUM(amount) as total')
-                ->groupBy('device_id');
-        }])->get();
+        $query = Device::query();
 
-        $devices = $devices->map(function ($device) {
-            return [
-                'id' => $device->id,
-                'device_id' => $device->device_id,
-                'device_name' => $device->device_name,
-                'is_active' => $device->is_active,
-                'last_seen_at' => $device->last_seen_at,
-                'created_at' => $device->created_at,
-                'transaction_count' => $device->transactions->first()->count ?? 0,
-                'total_earnings' => $device->transactions->first()->total ?? 0,
-            ];
-        });
+        if ($request->has('is_active')) {
+            $query->where('is_active', $request->boolean('is_active'));
+        }
 
-        return response()->json([
-            'success' => true,
-            'devices' => $devices,
-        ]);
+        if ($request->has('search')) {
+            $query->where('device_name', 'like', '%' . $request->search . '%');
+        }
+
+        $devices = $query->orderBy('created_at', 'desc')
+            ->paginate($request->get('per_page', 15));
+
+        return response()->json($devices);
     }
 
     public function store(Request $request): JsonResponse
     {
         $request->validate([
-            'device_name' => 'nullable|string|max:100',
+            'device_name' => 'required|string|max:255',
         ]);
 
         $device = Device::create([
-            'device_id' => Str::uuid()->toString(),
-            'api_key' => Device::generateApiKey(),
             'device_name' => $request->device_name,
-            'is_active' => true,
         ]);
 
         return response()->json([
-            'success' => true,
+            'message' => 'Device created successfully',
             'device' => [
                 'id' => $device->id,
-                'device_id' => $device->device_id,
+                'uuid' => $device->uuid,
                 'device_name' => $device->device_name,
-                'api_key' => $device->api_key, // Show on creation only
+                'api_key' => $device->api_key,
                 'is_active' => $device->is_active,
                 'created_at' => $device->created_at,
             ],
@@ -63,67 +51,52 @@ class DeviceController extends Controller
 
     public function show(Device $device): JsonResponse
     {
-        $device->load(['transactions', 'drawResults', 'users']);
-
         return response()->json([
-            'success' => true,
-            'device' => [
-                'id' => $device->id,
-                'device_id' => $device->device_id,
-                'device_name' => $device->device_name,
-                'is_active' => $device->is_active,
-                'last_seen_at' => $device->last_seen_at,
-                'created_at' => $device->created_at,
-                'statistics' => [
-                    'total_transactions' => $device->transactions->count(),
-                    'total_earnings' => $device->getTotalEarnings(),
-                    'today_earnings' => $device->getTodayEarnings(),
-                    'users_count' => $device->users->count(),
-                ],
-            ],
+            'id' => $device->id,
+            'uuid' => $device->uuid,
+            'device_name' => $device->device_name,
+            'api_key' => $device->api_key,
+            'is_active' => $device->is_active,
+            'last_sync_at' => $device->last_sync_at,
+            'last_ip' => $device->last_ip,
+            'created_at' => $device->created_at,
+            'updated_at' => $device->updated_at,
+            'transactions_count' => $device->transactions()->count(),
+            'device_users_count' => $device->deviceUsers()->count(),
         ]);
     }
 
     public function update(Request $request, Device $device): JsonResponse
     {
         $request->validate([
-            'device_name' => 'nullable|string|max:100',
-            'is_active' => 'nullable|boolean',
+            'device_name' => 'sometimes|string|max:255',
+            'is_active' => 'sometimes|boolean',
         ]);
 
         $device->update($request->only(['device_name', 'is_active']));
 
         return response()->json([
-            'success' => true,
-            'device' => [
-                'id' => $device->id,
-                'device_id' => $device->device_id,
-                'device_name' => $device->device_name,
-                'is_active' => $device->is_active,
-                'last_seen_at' => $device->last_seen_at,
-            ],
+            'message' => 'Device updated successfully',
+            'device' => $device->fresh(),
         ]);
     }
 
     public function destroy(Device $device): JsonResponse
     {
-        $device->update(['is_active' => false]);
+        $device->delete();
 
         return response()->json([
-            'success' => true,
-            'message' => 'Device deactivated',
+            'message' => 'Device deleted successfully',
         ]);
     }
 
     public function regenerateKey(Device $device): JsonResponse
     {
-        $newApiKey = Device::generateApiKey();
-        $device->update(['api_key' => $newApiKey]);
+        $newKey = $device->regenerateApiKey();
 
         return response()->json([
-            'success' => true,
-            'api_key' => $newApiKey,
-            'message' => 'API key regenerated. Please update the device.',
+            'message' => 'API key regenerated successfully',
+            'api_key' => $newKey,
         ]);
     }
 }

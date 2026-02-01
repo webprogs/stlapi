@@ -2,290 +2,317 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Device;
 use App\Models\DeviceUser;
 use App\Models\DrawResult;
+use App\Models\SyncLog;
 use App\Models\Transaction;
+use App\Rules\NumbersMatchGameType;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
 
 class SyncController extends Controller
 {
-    public function push(Request $request): JsonResponse
+    public function sync(Request $request): JsonResponse
     {
-        $request->validate([
-            'device_id' => 'required|string',
-            'device_name' => 'nullable|string|max:100',
-            'timestamp' => 'required|string',
-            'changes' => 'required|array',
-        ]);
-
-        $device = $request->device;
-
-        // Update device name if provided
-        if ($request->device_name && $request->device_name !== $device->device_name) {
-            $device->update(['device_name' => $request->device_name]);
-        }
-
-        $processed = [
-            'transactions' => [],
-            'draw_results' => [],
-            'users' => [],
-        ];
-
         try {
-            DB::beginTransaction();
+            $device = $request->get('device');
+            $table = $request->input('table');
 
-            // Process transactions
-            if (!empty($request->changes['transactions'])) {
-                foreach ($request->changes['transactions'] as $item) {
-                    $result = $this->processTransaction($device, $item);
-                    $processed['transactions'][] = $result;
-                }
+            // Common validation rules
+            $commonRules = [
+                'table' => 'required|string|in:transactions,draw_results',
+                'action' => 'required|string|in:insert,update,delete',
+                'recordId' => 'required',
+                'payload' => 'required|array',
+            ];
+
+            // Table-specific validation rules
+            if ($table === 'draw_results') {
+                $rules = array_merge($commonRules, [
+                    'payload.draw_date' => 'required|date',
+                    'payload.draw_time' => 'required|in:11AM,4PM,9PM',
+                    'payload.game_type' => 'required|in:SWER2,SWER3,SWER4',
+                    'payload.winning_numbers' => ['required', 'array', new NumbersMatchGameType($request->input('payload.game_type'))],
+                    'payload.is_official' => 'required|boolean',
+                    'payload.set_by' => 'required|exists:users,id',
+                    'payload.modified_at' => 'nullable|date',
+                ]);
+            } else {
+                $rules = array_merge($commonRules, [
+                    'payload.transaction_id' => 'required|string|unique:transactions,transaction_id',
+                    'payload.user_id' => 'nullable',
+                    'payload.game_type' => 'required|in:SWER2,SWER3,SWER4',
+                    'payload.numbers' => ['required', 'array', new NumbersMatchGameType($request->input('payload.game_type'))],
+                    'payload.amount' => 'required|numeric|min:' . config('stl.bet_limits.min') . '|max:' . config('stl.bet_limits.max'),
+                    'payload.draw_time' => 'required|in:11AM,4PM,9PM',
+                    'payload.draw_date' => 'required|date',
+                ]);
             }
 
-            // Process draw results
-            if (!empty($request->changes['draw_results'])) {
-                foreach ($request->changes['draw_results'] as $item) {
-                    $result = $this->processDrawResult($device, $item);
-                    $processed['draw_results'][] = $result;
-                }
+            $validator = Validator::make($request->all(), $rules);
+
+            if ($validator->fails()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Validation failed',
+                    'errors' => $validator->errors(),
+                ], 422);
             }
 
-            // Process users
-            if (!empty($request->changes['users'])) {
-                foreach ($request->changes['users'] as $item) {
-                    $result = $this->processUser($device, $item);
-                    $processed['users'][] = $result;
+            $payload = $request->input('payload');
+
+            if ($table === 'draw_results') {
+                // Check for duplicate draw result
+                $existing = DrawResult::where('draw_date', $payload['draw_date'])
+                    ->where('draw_time', $payload['draw_time'])
+                    ->where('game_type', $payload['game_type'])
+                    ->first();
+
+                if ($existing) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Draw result already exists for this draw_date, draw_time, and game_type',
+                        'draw_result' => $existing,
+                    ], 409);
                 }
+
+                $drawResult = DrawResult::create([
+                    'draw_date' => $payload['draw_date'],
+                    'draw_time' => $payload['draw_time'],
+                    'game_type' => $payload['game_type'],
+                    'winning_numbers' => $payload['winning_numbers'],
+                    'set_by' => $payload['set_by'],
+                    'is_official' => $payload['is_official'],
+                    'modified_at' => $payload['modified_at'] ?? null,
+                ]);
+
+                SyncLog::create([
+                    'device_id' => $device->id,
+                    'sync_type' => 'push',
+                    'records_synced' => 1,
+                    'status' => 'success',
+                    'ip_address' => $request->ip(),
+                ]);
+
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Draw result synced successfully',
+                    'draw_result' => $drawResult,
+                ], 201);
             }
 
-            DB::commit();
+            // Handle transactions (existing logic)
+            $transaction = Transaction::create([
+                'transaction_id' => $payload['transaction_id'],
+                'device_id' => $device->id,
+                'local_user_id' => $payload['user_id'] ?? null,
+                'game_type' => $payload['game_type'],
+                'numbers' => $payload['numbers'],
+                'amount' => $payload['amount'],
+                'draw_time' => $payload['draw_time'],
+                'draw_date' => $payload['draw_date'],
+                'local_created_at' => $payload['created_at'] ?? now(),
+            ]);
+
+            SyncLog::create([
+                'device_id' => $device->id,
+                'sync_type' => 'push',
+                'records_synced' => 1,
+                'status' => 'success',
+                'ip_address' => $request->ip(),
+            ]);
 
             return response()->json([
                 'success' => true,
-                'processed' => $processed,
-                'server_time' => now()->toIso8601String(),
-            ]);
-        } catch (\Exception $e) {
-            DB::rollBack();
-            Log::error('Sync push failed', [
-                'device_id' => $device->id,
-                'error' => $e->getMessage(),
-            ]);
+                'message' => 'Transaction synced successfully',
+                'transaction' => $transaction,
+            ], 201);
 
+        } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
-                'error' => 'Sync failed: ' . $e->getMessage(),
+                'message' => 'Sync failed',
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
 
-    private function processTransaction(Device $device, array $item): array
+    public function batch(Request $request): JsonResponse
     {
-        $localId = $item['local_id'];
-        $operation = $item['operation'];
-        $data = $item['data'];
+        $device = $request->get('device');
 
-        $existing = Transaction::where('device_id', $device->id)
-            ->where('local_id', $localId)
-            ->first();
+        $request->validate([
+            'transactions' => 'required|array|min:1',
+            'transactions.*.transaction_id' => 'required|string',
+            'transactions.*.local_user_id' => 'nullable|string',
+            'transactions.*.game_type' => 'required|in:SWER2,SWER3,SWER4',
+            'transactions.*.numbers' => 'required|array',
+            'transactions.*.amount' => 'required|numeric|min:' . config('stl.bet_limits.min') . '|max:' . config('stl.bet_limits.max'),
+            'transactions.*.draw_time' => 'required|in:11AM,4PM,9PM',
+            'transactions.*.draw_date' => 'required|date',
+            'transactions.*.local_created_at' => 'required|date',
+            'users' => 'sometimes|array',
+            'users.*.local_user_id' => 'required|string',
+            'users.*.name' => 'required|string',
+            'users.*.pin' => 'nullable|string',
+            'users.*.is_active' => 'sometimes|boolean',
+        ]);
 
-        if ($operation === 'INSERT' && !$existing) {
-            $transaction = Transaction::create([
-                'device_id' => $device->id,
-                'local_id' => $localId,
-                'transaction_id' => $data['transaction_id'],
-                'user_id' => $data['user_id'],
-                'amount' => $data['amount'],
-                'numbers' => $data['numbers'],
-                'game_type' => $data['game_type'],
-                'draw_date' => $data['draw_date'],
-                'draw_time' => $data['draw_time'],
-                'payment_method' => $data['payment_method'] ?? null,
-                'verified' => $data['verified'] ?? false,
-                'device_created_at' => $data['created_at'] ?? null,
-            ]);
-
-            return [
-                'local_id' => $localId,
-                'server_id' => $transaction->id,
-                'status' => 'created',
-            ];
-        }
-
-        if ($existing) {
-            // Update existing record
-            $existing->update([
-                'verified' => $data['verified'] ?? $existing->verified,
-            ]);
-
-            return [
-                'local_id' => $localId,
-                'server_id' => $existing->id,
-                'status' => 'updated',
-            ];
-        }
-
-        return [
-            'local_id' => $localId,
-            'server_id' => null,
-            'status' => 'skipped',
+        $results = [
+            'transactions' => ['synced' => 0, 'skipped' => 0, 'errors' => []],
+            'users' => ['synced' => 0, 'skipped' => 0, 'errors' => []],
         ];
-    }
 
-    private function processDrawResult(Device $device, array $item): array
-    {
-        $localId = $item['local_id'];
-        $operation = $item['operation'];
-        $data = $item['data'];
+        DB::beginTransaction();
 
-        $existing = DrawResult::where('device_id', $device->id)
-            ->where('local_id', $localId)
-            ->first();
+        try {
+            // Sync users first
+            if ($request->has('users')) {
+                foreach ($request->users as $userData) {
+                    $existingUser = DeviceUser::where('device_id', $device->id)
+                        ->where('local_user_id', $userData['local_user_id'])
+                        ->first();
 
-        if ($operation === 'INSERT' && !$existing) {
-            $result = DrawResult::create([
+                    if ($existingUser) {
+                        $existingUser->update([
+                            'name' => $userData['name'],
+                            'pin' => $userData['pin'] ?? $existingUser->pin,
+                            'is_active' => $userData['is_active'] ?? $existingUser->is_active,
+                        ]);
+                        $results['users']['skipped']++;
+                    } else {
+                        DeviceUser::create([
+                            'device_id' => $device->id,
+                            'local_user_id' => $userData['local_user_id'],
+                            'name' => $userData['name'],
+                            'pin' => $userData['pin'] ?? null,
+                            'is_active' => $userData['is_active'] ?? true,
+                        ]);
+                        $results['users']['synced']++;
+                    }
+                }
+            }
+
+            // Sync transactions
+            foreach ($request->transactions as $index => $txData) {
+                // Skip if already exists
+                if (Transaction::where('transaction_id', $txData['transaction_id'])->exists()) {
+                    $results['transactions']['skipped']++;
+                    continue;
+                }
+
+                // Validate numbers match game type
+                $validator = Validator::make($txData, [
+                    'numbers' => [new NumbersMatchGameType($txData['game_type'])],
+                ]);
+
+                if ($validator->fails()) {
+                    $results['transactions']['errors'][] = [
+                        'index' => $index,
+                        'transaction_id' => $txData['transaction_id'],
+                        'error' => $validator->errors()->first(),
+                    ];
+                    continue;
+                }
+
+                Transaction::create([
+                    'transaction_id' => $txData['transaction_id'],
+                    'device_id' => $device->id,
+                    'local_user_id' => $txData['local_user_id'] ?? null,
+                    'game_type' => $txData['game_type'],
+                    'numbers' => $txData['numbers'],
+                    'amount' => $txData['amount'],
+                    'draw_time' => $txData['draw_time'],
+                    'draw_date' => $txData['draw_date'],
+                    'local_created_at' => $txData['local_created_at'],
+                ]);
+                $results['transactions']['synced']++;
+            }
+
+            DB::commit();
+
+            $syncStatus = empty($results['transactions']['errors']) ? 'success' : 'partial';
+
+            SyncLog::create([
                 'device_id' => $device->id,
-                'local_id' => $localId,
-                'draw_date' => $data['draw_date'],
-                'draw_time' => $data['draw_time'],
-                'game_type' => $data['game_type'],
-                'winning_numbers' => $data['winning_numbers'],
-                'device_created_at' => $data['created_at'] ?? null,
+                'sync_type' => 'batch',
+                'records_synced' => $results['transactions']['synced'] + $results['users']['synced'],
+                'status' => $syncStatus,
+                'error_message' => !empty($results['transactions']['errors'])
+                    ? json_encode($results['transactions']['errors'])
+                    : null,
+                'ip_address' => $request->ip(),
             ]);
 
-            return [
-                'local_id' => $localId,
-                'server_id' => $result->id,
-                'status' => 'created',
-            ];
-        }
-
-        if ($existing) {
-            return [
-                'local_id' => $localId,
-                'server_id' => $existing->id,
-                'status' => 'exists',
-            ];
-        }
-
-        return [
-            'local_id' => $localId,
-            'server_id' => null,
-            'status' => 'skipped',
-        ];
-    }
-
-    private function processUser(Device $device, array $item): array
-    {
-        $localId = $item['local_id'];
-        $operation = $item['operation'];
-        $data = $item['data'];
-
-        $existing = DeviceUser::where('device_id', $device->id)
-            ->where('local_id', $localId)
-            ->first();
-
-        if ($operation === 'INSERT' && !$existing) {
-            $user = DeviceUser::create([
-                'device_id' => $device->id,
-                'local_id' => $localId,
-                'username' => $data['username'],
-                'role' => $data['role'],
-                'name' => $data['name'] ?? null,
-                'device_created_at' => $data['created_at'] ?? null,
+            return response()->json([
+                'message' => 'Batch sync completed',
+                'results' => $results,
             ]);
 
-            return [
-                'local_id' => $localId,
-                'server_id' => $user->id,
-                'status' => 'created',
-            ];
-        }
+        } catch (\Exception $e) {
+            DB::rollBack();
 
-        if ($existing) {
-            return [
-                'local_id' => $localId,
-                'server_id' => $existing->id,
-                'status' => 'exists',
-            ];
-        }
+            SyncLog::create([
+                'device_id' => $device->id,
+                'sync_type' => 'batch',
+                'records_synced' => 0,
+                'status' => 'failed',
+                'error_message' => $e->getMessage(),
+                'ip_address' => $request->ip(),
+            ]);
 
-        return [
-            'local_id' => $localId,
-            'server_id' => null,
-            'status' => 'skipped',
-        ];
+            return response()->json([
+                'message' => 'Batch sync failed',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
     }
 
     public function pull(Request $request): JsonResponse
     {
-        $device = $request->device;
-        $since = $request->query('since');
+        $device = $request->get('device');
 
-        // Get official (admin-created) draw results
-        // These take priority over any local device results
-        $drawResultsQuery = DrawResult::whereNull('device_id');
+        $request->validate([
+            'since' => 'nullable|date',
+            'draw_date' => 'nullable|date',
+        ]);
 
-        if ($since) {
-            $drawResultsQuery->where('updated_at', '>', $since);
+        $query = DrawResult::query();
+
+        if ($request->has('since')) {
+            $query->where('created_at', '>=', $request->since);
         }
 
-        $drawResults = $drawResultsQuery
-            ->orderBy('draw_date', 'desc')
-            ->orderBy('draw_time', 'asc')
-            ->limit(100) // Limit to prevent large payloads
-            ->get()
-            ->map(function ($result) {
-                return [
-                    'server_id' => $result->id,
-                    'draw_date' => $result->draw_date->format('Y-m-d'),
-                    'draw_time' => $result->draw_time,
-                    'game_type' => $result->game_type,
-                    'winning_numbers' => $result->winning_numbers,
-                    'is_official' => true, // Flag to indicate this is from server
-                    'created_at' => $result->created_at->toIso8601String(),
-                    'updated_at' => $result->updated_at->toIso8601String(),
-                ];
-            });
+        if ($request->has('draw_date')) {
+            $query->where('draw_date', $request->draw_date);
+        }
 
-        return response()->json([
-            'success' => true,
-            'changes' => [
-                'draw_results' => $drawResults,
-            ],
-            'server_time' => now()->toIso8601String(),
+        $drawResults = $query->orderBy('draw_date', 'desc')
+            ->orderBy('draw_time', 'desc')
+            ->get();
+
+        // Get updated transaction statuses for this device
+        $transactions = Transaction::where('device_id', $device->id)
+            ->whereIn('status', ['won', 'lost', 'claimed'])
+            ->when($request->has('since'), function ($q) use ($request) {
+                $q->where('updated_at', '>=', $request->since);
+            })
+            ->get(['transaction_id', 'status', 'win_amount', 'claimed_at']);
+
+        SyncLog::create([
+            'device_id' => $device->id,
+            'sync_type' => 'pull',
+            'records_synced' => $drawResults->count() + $transactions->count(),
+            'status' => 'success',
+            'ip_address' => $request->ip(),
         ]);
-    }
-
-    public function status(Request $request): JsonResponse
-    {
-        $device = $request->device;
 
         return response()->json([
-            'success' => true,
-            'device_registered' => true,
-            'device_name' => $device->device_name,
-            'device_id' => $device->device_id,
-            'is_active' => $device->is_active,
-            'last_sync' => $device->last_seen_at,
+            'draw_results' => $drawResults,
+            'transaction_updates' => $transactions,
             'server_time' => now()->toIso8601String(),
-        ]);
-    }
-
-    public function full(Request $request): JsonResponse
-    {
-        // Push first, then pull
-        $pushResponse = $this->push($request);
-        $pullResponse = $this->pull($request);
-
-        return response()->json([
-            'success' => true,
-            'push' => json_decode($pushResponse->getContent(), true),
-            'pull' => json_decode($pullResponse->getContent(), true),
         ]);
     }
 }
